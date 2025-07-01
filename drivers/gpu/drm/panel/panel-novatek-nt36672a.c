@@ -28,6 +28,14 @@
 
 #include <video/mipi_display.h>
 
+struct nt36672a_panel_cmd {
+	size_t len;
+	const u8 *payload;
+};
+
+#define NT36672A_CMD(_len, ...) \
+	{ .len = (_len), .payload = (const u8[]) { __VA_ARGS__ } }
+
 static const char * const nt36672a_regulator_names[] = {
 	"vddio",
 	"vddpos",
@@ -38,6 +46,11 @@ static unsigned long const nt36672a_regulator_enable_loads[] = {
 	62000,
 	100000,
 	100000
+};
+
+struct nt36672a_panel_reset_seq {
+	int gpio_value;
+	unsigned int sleep_msecs;
 };
 
 struct nt36672a_panel_desc {
@@ -51,9 +64,16 @@ struct nt36672a_panel_desc {
 	enum mipi_dsi_pixel_format format;
 	unsigned int lanes;
 
-	void (*send_init_cmds_1)(struct mipi_dsi_multi_context *dsi_ctx);
-	void (*send_init_cmds_2)(struct mipi_dsi_multi_context *dsi_ctx);
-	void (*send_deinit_cmds)(struct mipi_dsi_multi_context *dsi_ctx);
+	unsigned int num_on_cmds_1;
+	const struct nt36672a_panel_cmd *on_cmds_1;
+	unsigned int num_on_cmds_2;
+	const struct nt36672a_panel_cmd *on_cmds_2;
+
+	unsigned int num_off_cmds;
+	const struct nt36672a_panel_cmd *off_cmds;
+
+	unsigned int num_reset_seq;
+	const struct nt36672a_panel_reset_seq *reset_seq;
 };
 
 struct nt36672a_panel {
@@ -87,10 +107,13 @@ static int nt36672a_panel_unprepare(struct drm_panel *panel)
 {
 	struct nt36672a_panel *pinfo = to_nt36672a_panel(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->link };
+	int i;
 
 	/* send off cmds */
-	if (pinfo->desc->send_deinit_cmds)
-		pinfo->desc->send_deinit_cmds(&dsi_ctx);
+	for (i = 0; i < pinfo->desc->num_off_cmds; i++) {
+		const struct nt36672a_panel_cmd *cmd = &pinfo->desc->off_cmds[i];
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, cmd->payload, cmd->len);
+	}
 
 	/* Reset error to continue with display off even if send_cmds failed */
 	dsi_ctx.accum_err = 0;
@@ -113,22 +136,19 @@ static int nt36672a_panel_unprepare(struct drm_panel *panel)
 
 static int nt36672a_panel_power_on(struct nt36672a_panel *pinfo)
 {
-	int ret;
+	const struct nt36672a_panel_reset_seq *reset_seq;
+	int i;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(pinfo->supplies), pinfo->supplies);
+	int ret = regulator_bulk_enable(ARRAY_SIZE(pinfo->supplies), pinfo->supplies);
 	if (ret < 0)
 		return ret;
 
-	/*
-	 * As per downstream kernel, Reset sequence of Tianma FHD panel requires the panel to
-	 * be out of reset for 10ms, followed by being held in reset for 10ms. But for Android
-	 * AOSP, we needed to bump it upto 200ms otherwise we get white screen sometimes.
-	 * FIXME: Try to reduce this 200ms to a lesser value.
-	 */
-	gpiod_set_value(pinfo->reset_gpio, 1);
-	msleep(200);
-	gpiod_set_value(pinfo->reset_gpio, 0);
-	msleep(200);
+	reset_seq = pinfo->desc->reset_seq;
+
+	for (i = 0; i < pinfo->desc->num_reset_seq; i++) {
+		gpiod_set_value(pinfo->reset_gpio, reset_seq[i].gpio_value);
+		msleep(reset_seq[i].sleep_msecs);
+	}
 
 	return 0;
 }
@@ -137,12 +157,15 @@ static int nt36672a_panel_prepare(struct drm_panel *panel)
 {
 	struct nt36672a_panel *pinfo = to_nt36672a_panel(panel);
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = pinfo->link };
+	int i;
 
 	dsi_ctx.accum_err = nt36672a_panel_power_on(pinfo);
 
 	/* send first part of init cmds */
-	if (pinfo->desc->send_init_cmds_1)
-		pinfo->desc->send_init_cmds_1(&dsi_ctx);
+	for (i = 0; i < pinfo->desc->num_on_cmds_1; i++) {
+		const struct nt36672a_panel_cmd *cmd = &pinfo->desc->on_cmds_1[i];
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, cmd->payload, cmd->len);
+	}
 
 	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
 
@@ -152,8 +175,10 @@ static int nt36672a_panel_prepare(struct drm_panel *panel)
 	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
 
 	/* Send rest of the init cmds */
-	if (pinfo->desc->send_init_cmds_2)
-		pinfo->desc->send_init_cmds_2(&dsi_ctx);
+	for (i = 0; i < pinfo->desc->num_on_cmds_2; i++) {
+		const struct nt36672a_panel_cmd *cmd = &pinfo->desc->on_cmds_2[i];
+		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, cmd->payload, cmd->len);
+	}
 
 	mipi_dsi_msleep(&dsi_ctx, 120);
 
@@ -192,184 +217,321 @@ static const struct drm_panel_funcs panel_funcs = {
 	.get_modes = nt36672a_panel_get_modes,
 };
 
-static void tianma_fhd_video_send_init_cmds_1(struct mipi_dsi_multi_context *dsi_ctx)
-{
-	u8 reg;
-
+static const struct nt36672a_panel_cmd tianma_fhd_video_on_cmds_1[] = {
 	/* skin enhancement mode */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x22);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x00, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x01, 0xc0);
-	for (reg = 0x02; reg <= 0x10; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x11, 0x50);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x12, 0x60);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x13, 0x70);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x14, 0x58);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x15, 0x68);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x16, 0x78);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x17, 0x77);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x18, 0x39);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x19, 0x2d);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x1a, 0x2e);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x1b, 0x32);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x1c, 0x37);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x1d, 0x3a);
-	for (reg = 0x1e; reg <= 0x28; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2d, 0x00);
-	for (reg = 0x2f; reg <= 0x3b; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3d, 0x40);
-	for (reg = 0x3f; reg <= 0x52; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x53, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x54, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x55, 0xfe);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x56, 0x77);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x58, 0xcd);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x59, 0xd0);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x5a, 0xd0);
-	for (reg = 0x5b; reg <= 0x6f; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x50);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x70, 0x07);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x71, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x72, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x73, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x74, 0x06);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x75, 0x0c);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x76, 0x03);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x77, 0x09);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x78, 0x0f);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x79, 0x68);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x7a, 0x88);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x7c, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x7d, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x7e, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x7f, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x80, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x81, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x83, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x84, 0x00);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x85, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x86, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x87, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x88, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x89, 0x91);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x8a, 0x98);
-	for (reg = 0x8b; reg <= 0x9f; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xa0, 0x8a);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xa2, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xa6, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xa7, 0x80);
-	for (reg = 0xa9; reg <= 0xaf; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb7, 0x76);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb8, 0x76);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb9, 0x05);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xba, 0x0d);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbb, 0x14);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbc, 0x0f);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbd, 0x18);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbe, 0x1f);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbf, 0x05);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc0, 0x0d);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc1, 0x14);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc2, 0x03);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc3, 0x07);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x0a);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc5, 0xa0);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc6, 0x55);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc7, 0xff);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc8, 0x39);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc9, 0x44);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xca, 0x12);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xcd, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xdb, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xdc, 0x80);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xdd, 0x80);
-	for (reg = 0xe0; reg <= 0xe4; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x80);
-	for (reg = 0xe5; reg <= 0xf6; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0x40);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x23);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
+	NT36672A_CMD(2, 0xff, 0x22),
+	NT36672A_CMD(2, 0x00, 0x40),
+	NT36672A_CMD(2, 0x01, 0xc0),
+	NT36672A_CMD(2, 0x02, 0x40),
+	NT36672A_CMD(2, 0x03, 0x40),
+	NT36672A_CMD(2, 0x04, 0x40),
+	NT36672A_CMD(2, 0x05, 0x40),
+	NT36672A_CMD(2, 0x06, 0x40),
+	NT36672A_CMD(2, 0x07, 0x40),
+	NT36672A_CMD(2, 0x08, 0x40),
+	NT36672A_CMD(2, 0x09, 0x40),
+	NT36672A_CMD(2, 0x0a, 0x40),
+	NT36672A_CMD(2, 0x0b, 0x40),
+	NT36672A_CMD(2, 0x0c, 0x40),
+	NT36672A_CMD(2, 0x0d, 0x40),
+	NT36672A_CMD(2, 0x0e, 0x40),
+	NT36672A_CMD(2, 0x0f, 0x40),
+	NT36672A_CMD(2, 0x10, 0x40),
+	NT36672A_CMD(2, 0x11, 0x50),
+	NT36672A_CMD(2, 0x12, 0x60),
+	NT36672A_CMD(2, 0x13, 0x70),
+	NT36672A_CMD(2, 0x14, 0x58),
+	NT36672A_CMD(2, 0x15, 0x68),
+	NT36672A_CMD(2, 0x16, 0x78),
+	NT36672A_CMD(2, 0x17, 0x77),
+	NT36672A_CMD(2, 0x18, 0x39),
+	NT36672A_CMD(2, 0x19, 0x2d),
+	NT36672A_CMD(2, 0x1a, 0x2e),
+	NT36672A_CMD(2, 0x1b, 0x32),
+	NT36672A_CMD(2, 0x1c, 0x37),
+	NT36672A_CMD(2, 0x1d, 0x3a),
+	NT36672A_CMD(2, 0x1e, 0x40),
+	NT36672A_CMD(2, 0x1f, 0x40),
+	NT36672A_CMD(2, 0x20, 0x40),
+	NT36672A_CMD(2, 0x21, 0x40),
+	NT36672A_CMD(2, 0x22, 0x40),
+	NT36672A_CMD(2, 0x23, 0x40),
+	NT36672A_CMD(2, 0x24, 0x40),
+	NT36672A_CMD(2, 0x25, 0x40),
+	NT36672A_CMD(2, 0x26, 0x40),
+	NT36672A_CMD(2, 0x27, 0x40),
+	NT36672A_CMD(2, 0x28, 0x40),
+	NT36672A_CMD(2, 0x2d, 0x00),
+	NT36672A_CMD(2, 0x2f, 0x40),
+	NT36672A_CMD(2, 0x30, 0x40),
+	NT36672A_CMD(2, 0x31, 0x40),
+	NT36672A_CMD(2, 0x32, 0x40),
+	NT36672A_CMD(2, 0x33, 0x40),
+	NT36672A_CMD(2, 0x34, 0x40),
+	NT36672A_CMD(2, 0x35, 0x40),
+	NT36672A_CMD(2, 0x36, 0x40),
+	NT36672A_CMD(2, 0x37, 0x40),
+	NT36672A_CMD(2, 0x38, 0x40),
+	NT36672A_CMD(2, 0x39, 0x40),
+	NT36672A_CMD(2, 0x3a, 0x40),
+	NT36672A_CMD(2, 0x3b, 0x40),
+	NT36672A_CMD(2, 0x3d, 0x40),
+	NT36672A_CMD(2, 0x3f, 0x40),
+	NT36672A_CMD(2, 0x40, 0x40),
+	NT36672A_CMD(2, 0x41, 0x40),
+	NT36672A_CMD(2, 0x42, 0x40),
+	NT36672A_CMD(2, 0x43, 0x40),
+	NT36672A_CMD(2, 0x44, 0x40),
+	NT36672A_CMD(2, 0x45, 0x40),
+	NT36672A_CMD(2, 0x46, 0x40),
+	NT36672A_CMD(2, 0x47, 0x40),
+	NT36672A_CMD(2, 0x48, 0x40),
+	NT36672A_CMD(2, 0x49, 0x40),
+	NT36672A_CMD(2, 0x4a, 0x40),
+	NT36672A_CMD(2, 0x4b, 0x40),
+	NT36672A_CMD(2, 0x4c, 0x40),
+	NT36672A_CMD(2, 0x4d, 0x40),
+	NT36672A_CMD(2, 0x4e, 0x40),
+	NT36672A_CMD(2, 0x4f, 0x40),
+	NT36672A_CMD(2, 0x50, 0x40),
+	NT36672A_CMD(2, 0x51, 0x40),
+	NT36672A_CMD(2, 0x52, 0x40),
+	NT36672A_CMD(2, 0x53, 0x01),
+	NT36672A_CMD(2, 0x54, 0x01),
+	NT36672A_CMD(2, 0x55, 0xfe),
+	NT36672A_CMD(2, 0x56, 0x77),
+	NT36672A_CMD(2, 0x58, 0xcd),
+	NT36672A_CMD(2, 0x59, 0xd0),
+	NT36672A_CMD(2, 0x5a, 0xd0),
+	NT36672A_CMD(2, 0x5b, 0x50),
+	NT36672A_CMD(2, 0x5c, 0x50),
+	NT36672A_CMD(2, 0x5d, 0x50),
+	NT36672A_CMD(2, 0x5e, 0x50),
+	NT36672A_CMD(2, 0x5f, 0x50),
+	NT36672A_CMD(2, 0x60, 0x50),
+	NT36672A_CMD(2, 0x61, 0x50),
+	NT36672A_CMD(2, 0x62, 0x50),
+	NT36672A_CMD(2, 0x63, 0x50),
+	NT36672A_CMD(2, 0x64, 0x50),
+	NT36672A_CMD(2, 0x65, 0x50),
+	NT36672A_CMD(2, 0x66, 0x50),
+	NT36672A_CMD(2, 0x67, 0x50),
+	NT36672A_CMD(2, 0x68, 0x50),
+	NT36672A_CMD(2, 0x69, 0x50),
+	NT36672A_CMD(2, 0x6a, 0x50),
+	NT36672A_CMD(2, 0x6b, 0x50),
+	NT36672A_CMD(2, 0x6c, 0x50),
+	NT36672A_CMD(2, 0x6d, 0x50),
+	NT36672A_CMD(2, 0x6e, 0x50),
+	NT36672A_CMD(2, 0x6f, 0x50),
+	NT36672A_CMD(2, 0x70, 0x07),
+	NT36672A_CMD(2, 0x71, 0x00),
+	NT36672A_CMD(2, 0x72, 0x00),
+	NT36672A_CMD(2, 0x73, 0x00),
+	NT36672A_CMD(2, 0x74, 0x06),
+	NT36672A_CMD(2, 0x75, 0x0c),
+	NT36672A_CMD(2, 0x76, 0x03),
+	NT36672A_CMD(2, 0x77, 0x09),
+	NT36672A_CMD(2, 0x78, 0x0f),
+	NT36672A_CMD(2, 0x79, 0x68),
+	NT36672A_CMD(2, 0x7a, 0x88),
+	NT36672A_CMD(2, 0x7c, 0x80),
+	NT36672A_CMD(2, 0x7d, 0x80),
+	NT36672A_CMD(2, 0x7e, 0x80),
+	NT36672A_CMD(2, 0x7f, 0x00),
+	NT36672A_CMD(2, 0x80, 0x00),
+	NT36672A_CMD(2, 0x81, 0x00),
+	NT36672A_CMD(2, 0x83, 0x01),
+	NT36672A_CMD(2, 0x84, 0x00),
+	NT36672A_CMD(2, 0x85, 0x80),
+	NT36672A_CMD(2, 0x86, 0x80),
+	NT36672A_CMD(2, 0x87, 0x80),
+	NT36672A_CMD(2, 0x88, 0x40),
+	NT36672A_CMD(2, 0x89, 0x91),
+	NT36672A_CMD(2, 0x8a, 0x98),
+	NT36672A_CMD(2, 0x8b, 0x80),
+	NT36672A_CMD(2, 0x8c, 0x80),
+	NT36672A_CMD(2, 0x8d, 0x80),
+	NT36672A_CMD(2, 0x8e, 0x80),
+	NT36672A_CMD(2, 0x8f, 0x80),
+	NT36672A_CMD(2, 0x90, 0x80),
+	NT36672A_CMD(2, 0x91, 0x80),
+	NT36672A_CMD(2, 0x92, 0x80),
+	NT36672A_CMD(2, 0x93, 0x80),
+	NT36672A_CMD(2, 0x94, 0x80),
+	NT36672A_CMD(2, 0x95, 0x80),
+	NT36672A_CMD(2, 0x96, 0x80),
+	NT36672A_CMD(2, 0x97, 0x80),
+	NT36672A_CMD(2, 0x98, 0x80),
+	NT36672A_CMD(2, 0x99, 0x80),
+	NT36672A_CMD(2, 0x9a, 0x80),
+	NT36672A_CMD(2, 0x9b, 0x80),
+	NT36672A_CMD(2, 0x9c, 0x80),
+	NT36672A_CMD(2, 0x9d, 0x80),
+	NT36672A_CMD(2, 0x9e, 0x80),
+	NT36672A_CMD(2, 0x9f, 0x80),
+	NT36672A_CMD(2, 0xa0, 0x8a),
+	NT36672A_CMD(2, 0xa2, 0x80),
+	NT36672A_CMD(2, 0xa6, 0x80),
+	NT36672A_CMD(2, 0xa7, 0x80),
+	NT36672A_CMD(2, 0xa9, 0x80),
+	NT36672A_CMD(2, 0xaa, 0x80),
+	NT36672A_CMD(2, 0xab, 0x80),
+	NT36672A_CMD(2, 0xac, 0x80),
+	NT36672A_CMD(2, 0xad, 0x80),
+	NT36672A_CMD(2, 0xae, 0x80),
+	NT36672A_CMD(2, 0xaf, 0x80),
+	NT36672A_CMD(2, 0xb7, 0x76),
+	NT36672A_CMD(2, 0xb8, 0x76),
+	NT36672A_CMD(2, 0xb9, 0x05),
+	NT36672A_CMD(2, 0xba, 0x0d),
+	NT36672A_CMD(2, 0xbb, 0x14),
+	NT36672A_CMD(2, 0xbc, 0x0f),
+	NT36672A_CMD(2, 0xbd, 0x18),
+	NT36672A_CMD(2, 0xbe, 0x1f),
+	NT36672A_CMD(2, 0xbf, 0x05),
+	NT36672A_CMD(2, 0xc0, 0x0d),
+	NT36672A_CMD(2, 0xc1, 0x14),
+	NT36672A_CMD(2, 0xc2, 0x03),
+	NT36672A_CMD(2, 0xc3, 0x07),
+	NT36672A_CMD(2, 0xc4, 0x0a),
+	NT36672A_CMD(2, 0xc5, 0xa0),
+	NT36672A_CMD(2, 0xc6, 0x55),
+	NT36672A_CMD(2, 0xc7, 0xff),
+	NT36672A_CMD(2, 0xc8, 0x39),
+	NT36672A_CMD(2, 0xc9, 0x44),
+	NT36672A_CMD(2, 0xca, 0x12),
+	NT36672A_CMD(2, 0xcd, 0x80),
+	NT36672A_CMD(2, 0xdb, 0x80),
+	NT36672A_CMD(2, 0xdc, 0x80),
+	NT36672A_CMD(2, 0xdd, 0x80),
+	NT36672A_CMD(2, 0xe0, 0x80),
+	NT36672A_CMD(2, 0xe1, 0x80),
+	NT36672A_CMD(2, 0xe2, 0x80),
+	NT36672A_CMD(2, 0xe3, 0x80),
+	NT36672A_CMD(2, 0xe4, 0x80),
+	NT36672A_CMD(2, 0xe5, 0x40),
+	NT36672A_CMD(2, 0xe6, 0x40),
+	NT36672A_CMD(2, 0xe7, 0x40),
+	NT36672A_CMD(2, 0xe8, 0x40),
+	NT36672A_CMD(2, 0xe9, 0x40),
+	NT36672A_CMD(2, 0xea, 0x40),
+	NT36672A_CMD(2, 0xeb, 0x40),
+	NT36672A_CMD(2, 0xec, 0x40),
+	NT36672A_CMD(2, 0xed, 0x40),
+	NT36672A_CMD(2, 0xee, 0x40),
+	NT36672A_CMD(2, 0xef, 0x40),
+	NT36672A_CMD(2, 0xf0, 0x40),
+	NT36672A_CMD(2, 0xf1, 0x40),
+	NT36672A_CMD(2, 0xf2, 0x40),
+	NT36672A_CMD(2, 0xf3, 0x40),
+	NT36672A_CMD(2, 0xf4, 0x40),
+	NT36672A_CMD(2, 0xf5, 0x40),
+	NT36672A_CMD(2, 0xf6, 0x40),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0xff, 0x23),
+	NT36672A_CMD(2, 0xfb, 0x01),
 	/* dimming enable */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x01, 0x84);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x05, 0x2d);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x06, 0x00);
+	NT36672A_CMD(2, 0x01, 0x84),
+	NT36672A_CMD(2, 0x05, 0x2d),
+	NT36672A_CMD(2, 0x06, 0x00),
 	/* resolution 1080*2246 */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x11, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x12, 0x7b);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x15, 0x6f);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x16, 0x0b);
+	NT36672A_CMD(2, 0x11, 0x01),
+	NT36672A_CMD(2, 0x12, 0x7b),
+	NT36672A_CMD(2, 0x15, 0x6f),
+	NT36672A_CMD(2, 0x16, 0x0b),
 	/* UI mode */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x29, 0x0a);
-	for (reg = 0x30; reg <= 0x37; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0xff);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x38, 0xfc);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x39, 0xf8);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3a, 0xf4);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3b, 0xf1);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3d, 0xee);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x3f, 0xeb);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x40, 0xe8);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x41, 0xe5);
+	NT36672A_CMD(2, 0x29, 0x0a),
+	NT36672A_CMD(2, 0x30, 0xff),
+	NT36672A_CMD(2, 0x31, 0xff),
+	NT36672A_CMD(2, 0x32, 0xff),
+	NT36672A_CMD(2, 0x33, 0xff),
+	NT36672A_CMD(2, 0x34, 0xff),
+	NT36672A_CMD(2, 0x35, 0xff),
+	NT36672A_CMD(2, 0x36, 0xff),
+	NT36672A_CMD(2, 0x37, 0xff),
+	NT36672A_CMD(2, 0x38, 0xfc),
+	NT36672A_CMD(2, 0x39, 0xf8),
+	NT36672A_CMD(2, 0x3a, 0xf4),
+	NT36672A_CMD(2, 0x3b, 0xf1),
+	NT36672A_CMD(2, 0x3d, 0xee),
+	NT36672A_CMD(2, 0x3f, 0xeb),
+	NT36672A_CMD(2, 0x40, 0xe8),
+	NT36672A_CMD(2, 0x41, 0xe5),
 	/* STILL mode */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2a, 0x13);
-	for (reg = 0x45; reg <= 0x4c; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0xff);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4d, 0xed);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4e, 0xd5);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x4f, 0xbf);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x50, 0xa6);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x51, 0x96);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x52, 0x86);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x53, 0x76);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x54, 0x66);
+	NT36672A_CMD(2, 0x2a, 0x13),
+	NT36672A_CMD(2, 0x45, 0xff),
+	NT36672A_CMD(2, 0x46, 0xff),
+	NT36672A_CMD(2, 0x47, 0xff),
+	NT36672A_CMD(2, 0x48, 0xff),
+	NT36672A_CMD(2, 0x49, 0xff),
+	NT36672A_CMD(2, 0x4a, 0xff),
+	NT36672A_CMD(2, 0x4b, 0xff),
+	NT36672A_CMD(2, 0x4c, 0xff),
+	NT36672A_CMD(2, 0x4d, 0xed),
+	NT36672A_CMD(2, 0x4e, 0xd5),
+	NT36672A_CMD(2, 0x4f, 0xbf),
+	NT36672A_CMD(2, 0x50, 0xa6),
+	NT36672A_CMD(2, 0x51, 0x96),
+	NT36672A_CMD(2, 0x52, 0x86),
+	NT36672A_CMD(2, 0x53, 0x76),
+	NT36672A_CMD(2, 0x54, 0x66),
 	/* MOVING mode */
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x2b, 0x0e);
-	for (reg = 0x58; reg <= 0x5f; reg++)
-		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, reg, 0xff);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x60, 0xf6);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x61, 0xea);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x62, 0xe1);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x63, 0xd8);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x64, 0xce);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x65, 0xc3);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x66, 0xba);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x67, 0xb3);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x25);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x05, 0x04);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x26);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x1c, 0xaf);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x10);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x51, 0xff);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x53, 0x24);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x55, 0x00);
-}
+	NT36672A_CMD(2, 0x2b, 0x0e),
+	NT36672A_CMD(2, 0x58, 0xff),
+	NT36672A_CMD(2, 0x59, 0xff),
+	NT36672A_CMD(2, 0x5a, 0xff),
+	NT36672A_CMD(2, 0x5b, 0xff),
+	NT36672A_CMD(2, 0x5c, 0xff),
+	NT36672A_CMD(2, 0x5d, 0xff),
+	NT36672A_CMD(2, 0x5e, 0xff),
+	NT36672A_CMD(2, 0x5f, 0xff),
+	NT36672A_CMD(2, 0x60, 0xf6),
+	NT36672A_CMD(2, 0x61, 0xea),
+	NT36672A_CMD(2, 0x62, 0xe1),
+	NT36672A_CMD(2, 0x63, 0xd8),
+	NT36672A_CMD(2, 0x64, 0xce),
+	NT36672A_CMD(2, 0x65, 0xc3),
+	NT36672A_CMD(2, 0x66, 0xba),
+	NT36672A_CMD(2, 0x67, 0xb3),
+	NT36672A_CMD(2, 0xff, 0x25),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0x05, 0x04),
+	NT36672A_CMD(2, 0xff, 0x26),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0x1c, 0xaf),
+	NT36672A_CMD(2, 0xff, 0x10),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0x51, 0xff),
+	NT36672A_CMD(2, 0x53, 0x24),
+	NT36672A_CMD(2, 0x55, 0x00),
+};
 
-static void tianma_fhd_video_send_init_cmds_2(struct mipi_dsi_multi_context *dsi_ctx)
-{
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x24);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc3, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x54);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x10);
-}
+static const struct nt36672a_panel_cmd tianma_fhd_video_on_cmds_2[] = {
+	NT36672A_CMD(2, 0xff, 0x24),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0xc3, 0x01),
+	NT36672A_CMD(2, 0xc4, 0x54),
+	NT36672A_CMD(2, 0xff, 0x10),
+};
 
-static void tianma_fhd_video_send_deinit_cmds(struct mipi_dsi_multi_context *dsi_ctx)
-{
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x24);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc3, 0x01);
-	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x10);
-}
+static const struct nt36672a_panel_cmd tianma_fhd_video_off_cmds[] = {
+	NT36672A_CMD(2, 0xff, 0x24),
+	NT36672A_CMD(2, 0xfb, 0x01),
+	NT36672A_CMD(2, 0xc3, 0x01),
+	NT36672A_CMD(2, 0xff, 0x10),
+};
+
+/*
+ * As per downstream kernel, Reset sequence of Tianma FHD panel requires the panel to
+ * be out of reset for 10ms, followed by being held in reset for 10ms. But for Android
+ * AOSP, we needed to bump it up to 200ms otherwise we get white screen sometimes.
+ * FIXME: Try to reduce this 200ms to a lesser value.
+ */
+static const struct nt36672a_panel_reset_seq tianma_fhd_video_reset_seq[] = {
+	{ .gpio_value = 1, .sleep_msecs = 200 },
+	{ .gpio_value = 0, .sleep_msecs = 200 },
+};
 
 static const struct drm_display_mode tianma_fhd_video_panel_default_mode = {
 	.clock		= 161331,
@@ -399,9 +561,14 @@ static const struct nt36672a_panel_desc tianma_fhd_video_panel_desc = {
 			| MIPI_DSI_MODE_VIDEO_BURST,
 	.format = MIPI_DSI_FMT_RGB888,
 	.lanes = 4,
-	.send_init_cmds_1 = tianma_fhd_video_send_init_cmds_1,
-	.send_init_cmds_2 = tianma_fhd_video_send_init_cmds_2,
-	.send_deinit_cmds = tianma_fhd_video_send_deinit_cmds,
+	.on_cmds_1 = tianma_fhd_video_on_cmds_1,
+	.num_on_cmds_1 = ARRAY_SIZE(tianma_fhd_video_on_cmds_1),
+	.on_cmds_2 = tianma_fhd_video_on_cmds_2,
+	.num_on_cmds_2 = ARRAY_SIZE(tianma_fhd_video_on_cmds_2),
+	.off_cmds = tianma_fhd_video_off_cmds,
+	.num_off_cmds = ARRAY_SIZE(tianma_fhd_video_off_cmds),
+	.reset_seq = tianma_fhd_video_reset_seq,
+	.num_reset_seq = ARRAY_SIZE(tianma_fhd_video_reset_seq),
 };
 
 static int nt36672a_panel_add(struct nt36672a_panel *pinfo)
@@ -479,16 +646,23 @@ static void nt36672a_panel_remove(struct mipi_dsi_device *dsi)
 	drm_panel_remove(&pinfo->base);
 }
 
-static const struct of_device_id tianma_fhd_video_of_match[] = {
-	{ .compatible = "tianma,fhd-video", .data = &tianma_fhd_video_panel_desc },
-	{ },
+static const struct of_device_id nt36672a_of_match[] = {
+	{
+		.compatible = "tianma,fhd-video",
+		.data = &tianma_fhd_video_panel_desc,
+	},
+	{
+		.compatible = "xiaomi,beryllium-tianma-nt36672a",
+		.data = &tianma_fhd_video_panel_desc,
+	},
+	{ /* sentinel */ }
 };
-MODULE_DEVICE_TABLE(of, tianma_fhd_video_of_match);
+MODULE_DEVICE_TABLE(of, nt36672a_of_match);
 
 static struct mipi_dsi_driver nt36672a_panel_driver = {
 	.driver = {
-		.name = "panel-tianma-nt36672a",
-		.of_match_table = tianma_fhd_video_of_match,
+		.name = "panel-novatek-nt36672a",
+		.of_match_table = nt36672a_of_match,
 	},
 	.probe = nt36672a_panel_probe,
 	.remove = nt36672a_panel_remove,
