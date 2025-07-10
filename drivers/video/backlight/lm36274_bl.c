@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-// TI LM36274 LED chip family driver
+// TI LM36274 Backlight chip family driver
 // Copyright (C) 2019 Texas Instruments Incorporated - https://www.ti.com/
 
+#include <linux/backlight.h>
 #include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/err.h>
-#include <linux/leds.h>
 #include <linux/leds-ti-lmu-common.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -14,15 +14,13 @@
 #include <linux/mfd/ti-lmu.h>
 #include <linux/mfd/ti-lmu-register.h>
 
-#include <uapi/linux/uleds.h>
-
 #define LM36274_MAX_STRINGS	4
 #define LM36274_BL_EN		BIT(4)
 
 /**
  * struct lm36274
  * @pdev: platform device
- * @led_dev: led class device
+ * @bl_dev: backlight device
  * @lmu_data: Register and setting values for common code
  * @regmap: Devices register map
  * @dev: Pointer to the devices device struct
@@ -31,7 +29,7 @@
  */
 struct lm36274 {
 	struct platform_device *pdev;
-	struct led_classdev led_dev;
+	struct backlight_device *bl_dev;
 	struct ti_lmu_bank lmu_data;
 	struct regmap *regmap;
 	struct device *dev;
@@ -40,13 +38,18 @@ struct lm36274 {
 	int num_leds;
 };
 
-static int lm36274_brightness_set(struct led_classdev *led_cdev,
-				  enum led_brightness brt_val)
+static int lm36274_bl_update_status(struct backlight_device *bl_dev)
 {
-	struct lm36274 *chip = container_of(led_cdev, struct lm36274, led_dev);
+	struct lm36274 *chip = bl_get_data(bl_dev);
+	int brt_val = backlight_get_brightness(bl_dev);
 
 	return ti_lmu_common_set_brightness(&chip->lmu_data, brt_val);
 }
+
+static const struct backlight_ops lm36274_bl_ops = {
+	.options = BL_CORE_SUSPENDRESUME,
+	.update_status = lm36274_bl_update_status,
+};
 
 static int lm36274_init(struct lm36274 *chip)
 {
@@ -67,10 +70,12 @@ static int lm36274_init(struct lm36274 *chip)
 }
 
 static int lm36274_parse_dt(struct lm36274 *chip,
-			    struct led_init_data *init_data)
+			    struct led_init_data *init_data,
+			    struct backlight_properties *props)
 {
 	struct device *dev = chip->dev;
 	struct fwnode_handle *child;
+	u32 brightness;
 	int ret;
 
 	/* There should only be 1 node */
@@ -97,6 +102,19 @@ static int lm36274_parse_dt(struct lm36274 *chip,
 		goto err;
 	}
 
+	ret = fwnode_property_read_u32(child, "max-brightness", &brightness);
+	if (ret)
+		brightness = MAX_BRIGHTNESS_11BIT;
+
+	props->max_brightness = min_t(u32, brightness, MAX_BRIGHTNESS_11BIT);
+
+	ret = fwnode_property_read_u32(child, "default-brightness",
+				       &brightness);
+	if (ret)
+		brightness = props->max_brightness;
+
+	props->brightness = min_t(u32, brightness, props->max_brightness);
+
 	return 0;
 err:
 	fwnode_handle_put(child);
@@ -110,6 +128,10 @@ static int lm36274_probe(struct platform_device *pdev)
 	struct lm36274 *chip;
 	int ret;
 
+	struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+	};
+
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
@@ -119,7 +141,7 @@ static int lm36274_probe(struct platform_device *pdev)
 	chip->regmap = lmu->regmap;
 	platform_set_drvdata(pdev, chip);
 
-	ret = lm36274_parse_dt(chip, &init_data);
+	ret = lm36274_parse_dt(chip, &init_data, &props);
 	if (ret) {
 		dev_err(chip->dev, "Failed to parse DT node\n");
 		return ret;
@@ -137,16 +159,16 @@ static int lm36274_probe(struct platform_device *pdev)
 	chip->lmu_data.msb_brightness_reg = LM36274_REG_BRT_MSB;
 	chip->lmu_data.lsb_brightness_reg = LM36274_REG_BRT_LSB;
 
-	chip->led_dev.max_brightness = MAX_BRIGHTNESS_11BIT;
-	chip->led_dev.brightness_set_blocking = lm36274_brightness_set;
-
-	ret = devm_led_classdev_register_ext(chip->dev, &chip->led_dev,
-					     &init_data);
-	if (ret)
-		dev_err(chip->dev, "Failed to register LED for node %pfw\n",
+	chip->bl_dev = devm_backlight_device_register(&pdev->dev, pdev->name,
+						      &pdev->dev, chip,
+						      &lm36274_bl_ops, &props);
+	if (IS_ERR(chip->bl_dev))
+		dev_err(chip->dev,
+			"Failed to register backlight for node %pfw\n",
 			init_data.fwnode);
 
 	fwnode_handle_put(init_data.fwnode);
+	backlight_update_status(chip->bl_dev);
 
 	return ret;
 }
@@ -160,12 +182,12 @@ MODULE_DEVICE_TABLE(of, of_lm36274_leds_match);
 static struct platform_driver lm36274_driver = {
 	.probe  = lm36274_probe,
 	.driver = {
-		.name = "lm36274-leds",
+		.name = "lm36274-backlight",
 		.of_match_table = of_lm36274_leds_match,
 	},
 };
-module_platform_driver(lm36274_driver)
+module_platform_driver(lm36274_driver);
 
-MODULE_DESCRIPTION("Texas Instruments LM36274 LED driver");
+MODULE_DESCRIPTION("Texas Instruments LM36274 Backlight driver");
 MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
 MODULE_LICENSE("GPL v2");
