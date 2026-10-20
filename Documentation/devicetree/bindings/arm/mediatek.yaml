@@ -65,6 +65,7 @@ properties:
       - items:
           - enum:
               - xiaomi,begonia
+              - xiaomi,maltose
           - const: mediatek,mt6785
       - items:
           - enum:

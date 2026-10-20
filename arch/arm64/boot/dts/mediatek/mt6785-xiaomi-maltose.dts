@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Redmi Note 10S (maltose, M2101K7BL), DTS MINIMO Y EXPERIMENTAL.
+ * Objetivo: arrancar hasta simple-framebuffer y dejar logs en pstore.
+ *
+ * Direcciones tomadas de /sys/firmware/fdt del telefono.
+ */
+
+/dts-v1/;
+
+#include "mt6785.dtsi"
+
+/ {
+	model = "Xiaomi Redmi Note 10S (maltose)";
+	compatible = "xiaomi,maltose", "mediatek,mt6785";
+	chassis-type = "handset";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* 1080 x 2400 x 4 bytes = 0x9e3400. El formato hay que probarlo */
+		framebuffer0: framebuffer@7bd20000 {
+			compatible = "simple-framebuffer";
+			reg = <0 0x7bd20000 0 0x9e3400>;
+			width = <1080>;
+			height = <2400>;
+			stride = <(1080 * 4)>;
+			format = "a8r8g8b8";
+		};
+	};
+
+	/*
+	 * LK (el bootloader) modifica este DTB y anade su propio mapa de memoria.
+	 * Esta es la memoria del runtime (6 GiB); LK la corrige si hace falta.
+	 */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0 0x40000000 0x1 0x80000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * Region completa del framebuffer segun el runtime DTS
+		 * (mblock-20-framebuffer, 0x22e0000).
+		 * POSIBLE SOLAPE si LK ya anade esta region: comprobar.
+		 */
+		framebuffer@7bd20000 {
+			reg = <0 0x7bd20000 0 0x22e0000>;
+			no-map;
+		};
+
+		/*
+		 * pstore: mismos valores que ramoops.* del cmdline de Android
+		 * (mem_address 0x4d010000, mem_size 0xe0000,
+		 * console 0x40000, pmsg 0x10000).
+		 */
+		ramoops@4d010000 {
+			compatible = "ramoops";
+			reg = <0 0x4d010000 0 0xe0000>;
+			no-map;
+			record-size = <0x1000>;
+			console-size = <0x40000>;
+			pmsg-size = <0x10000>;
+			ftrace-size = <0>;
+		};
+	};
+};
