@@ -36,11 +36,12 @@ jobs:
 
       - name: Configure Kernel (defconfig)
         run: |
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          make ARCH=arm64 LLVM=1 olddefconfig
 
       - name: Build Device Trees (dtbs)
         run: |
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- dtbs -j$(nproc)
+          make ARCH=arm64 LLVM=1 mediatek/mt6785-xiaomi-maltose.dtb
+          ls -l arch/arm64/boot/dts/mediatek/mt6785-xiaomi-maltose.dtb
 
       - name: Archive generated DTBS and Config
         uses: actions/upload-artifact@v4
