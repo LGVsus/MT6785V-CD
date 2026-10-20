@@ -37,12 +37,12 @@ jobs:
         run: |
           cp configs/config-postmarketos-mediatek-mt6785.aarch64 .config
           scripts/config -e DRM -e DRM_SIMPLEDRM -e PSTORE_PMSG
-          make ARCH=arm64 LLVM=1 -k -j$(nproc) Image.gz mediatek/mt6785-xiaomi-maltose.dtb 2>&1 | tee build.log
+          make ARCH=arm64 LLVM=1 olddefconfig
           grep -E "CONFIG_DRM_SIMPLEDRM|CONFIG_PSTORE_RAM|CONFIG_PSTORE_PMSG" .config
 
       - name: Compile kernel
         run: |
-          make ARCH=arm64 LLVM=1 -j$(nproc) Image.gz mediatek/mt6785-xiaomi-maltose.dtb
+          make ARCH=arm64 LLVM=1 -k -j$(nproc) Image.gz mediatek/mt6785-xiaomi-maltose.dtb 2>&1 | tee build.log
           cp .config kernel.config
 
       - name: Upload Artifact
