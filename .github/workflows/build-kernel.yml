@@ -1,4 +1,4 @@
-name: Compile Kernel Config & DTBS
+name: Compile Kernel
 
 on:
   push:
@@ -31,18 +31,26 @@ jobs:
 
       - name: Setup Toolchain (GCC for arm64)
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu clang lld
+          sudo apt-get install -y gcc-aarch64-linux-gnu clang lld llvm bc flex bison libssl-dev libelf-dev
 
       - name: Configure kernel
         run: |
           cp configs/config-postmarketos-mediatek-mt6785.aarch64 .config
           scripts/config -e DRM -e DRM_SIMPLEDRM -e PSTORE_PMSG
           make ARCH=arm64 LLVM=1 olddefconfig
-          
-      - name: Archive generated DTBS and Config
+          grep -E "CONFIG_DRM_SIMPLEDRM|CONFIG_PSTORE_RAM|CONFIG_PSTORE_PMSG" .config
+
+      - name: Compile kernel
+        run: |
+          make ARCH=arm64 LLVM=1 -j$(nproc) Image.gz mediatek/mt6785-xiaomi-maltose.dtb
+          cp .config kernel.config
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-dtbs-and-config
+          name: kernel-mt6785
+          if-no-files-found: error
           path: |
-            .config
-            arch/arm64/boot/dts/mediatek/*.dtb
+            arch/arm64/boot/Image.gz
+            arch/arm64/boot/dts/mediatek/mt6785-xiaomi-maltose.dtb
+            kernel.config
